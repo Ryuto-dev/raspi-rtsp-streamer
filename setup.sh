@@ -4,7 +4,7 @@
 set -e
 
 echo "=================================================="
-echo "  Raspberry Pi 5 RTSP Streamer Auto Setup"
+echo "  Raspberry Pi 5 RTSP Streamer Auto Setup (Fixed)"
 echo "  Resolution: 1600x1200 / Transport: TCP"
 echo "=================================================="
 
@@ -19,14 +19,14 @@ TARGET_DIR="$HOME/mediamtx"
 mkdir -p "$TARGET_DIR"
 cd "$TARGET_DIR"
 
-# 二重起動防止のため、古いプロセスがあれば終了
-sudo killall mediamtx || true
-sudo killall ffmpeg || true
+# 【修正ポイント】エラーを絶対に出さない安全なプロセス終了方法に変更
+sudo pkill -f mediamtx > /dev/null 2>&1 || true
+sudo pkill -f ffmpeg > /dev/null 2>&1 || true
 
-# GitHubから最新のarm64版アーキテクチャ（ラズパイ5用）を自動取得
+# GitHubから最新のarm64版アーキテクチャ（ラズパイ5用）を取得
 wget -q --show-progress https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_arm64.tar.gz
 tar -xf mediamtx_linux_arm64.tar.gz
-rm mediamtx_linux_arm64.tar.gz
+rm -f mediamtx_linux_arm64.tar.gz
 
 # 3. systemd サービスファイルの生成 (MediaMTX)
 echo "[3/4] Creating systemd service files..."
@@ -76,7 +76,7 @@ sudo systemctl restart mediamtx.service
 sudo systemctl restart ffmpeg-rtsp.service
 
 echo "=================================================="
-echo "  セットアップが完了しました！"
+echo "  セットアップが今度こそ完了しました！"
 echo "  以下のコマンドで稼働状態を確認できます："
 echo "  sudo systemctl status mediamtx ffmpeg-rtsp"
 echo "=================================================="
