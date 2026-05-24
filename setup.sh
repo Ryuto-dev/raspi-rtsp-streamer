@@ -11,7 +11,7 @@ echo "=================================================="
 # 1. パッケージの更新とFFmpeg, v4l-utilsのインストール
 echo "[1/4] Updating packages and installing FFmpeg / tools..."
 sudo apt update
-sudo apt install -y ffmpeg v4l-utils wget tar
+sudo apt install -y ffmpeg v4l-utils wget tar curl
 
 # 2. MediaMTXのディレクトリ作成と最新版ダウンロード
 echo "[2/4] Downloading and extracting MediaMTX..."
@@ -24,7 +24,8 @@ sudo pkill -f mediamtx > /dev/null 2>&1 || true
 sudo pkill -f ffmpeg > /dev/null 2>&1 || true
 
 # GitHubから最新のarm64版アーキテクチャ（ラズパイ5用）を取得
-wget -q --show-progress https://github.com/bluenviron/mediamtx/releases/latest/download/mediamtx_linux_arm64.tar.gz
+DOWNLOAD_URL=$(curl -s https://api.github.com/repos/bluenviron/mediamtx/releases/latest | grep "browser_download_url" | grep "linux_arm64" | cut -d '"' -f 4 | head -n 1)
+wget -q --show-progress -O mediamtx_linux_arm64.tar.gz "$DOWNLOAD_URL"
 tar -xf mediamtx_linux_arm64.tar.gz
 rm -f mediamtx_linux_arm64.tar.gz
 
