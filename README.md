@@ -1,166 +1,201 @@
 # Raspberry Pi 5 RTSP Streamer
 
-このプロジェクトは、Raspberry Pi 5 と UVC カメラ（USB カメラ）を使用して、RTSP ストリーミングサーバーを自動的にセットアップするためのスクリプト群です。
+Raspberry Pi 5 と USB (UVC) カメラを使って、家庭内 LAN や学内 LAN に **RTSP ストリーミングサーバ** を立てるための自動セットアップツールです。
 
-## 特徴
+`setup.sh` を 1 回叩くだけで、以下を全て自動で行います。
 
-- **MediaMTX**: 高性能な RTSP/RTMP/HLS/WebRTC サーバー（自動ダウンロード対応）。
-- **FFmpeg**: カメラ映像を H.264 にエンコードし、MediaMTX に配信。
-- **systemd 対応**: 再起動後も自動的にストリーミングを開始します。
-- **最適化**: Raspberry Pi 5 向けに、1600x1200 / 15fps / TCP 転送で設定されています。
-- **堅牢な起動順序**: `ffmpeg-rtsp` は `/dev/video0` と RTSP ポート 8554 が準備できるまで待機します。
-- **オフライン対応**: ネットワークが無い環境向けに、MediaMTX バイナリをリポジトリに同梱できます（後述）。
+1. 必要パッケージ (`ffmpeg`, `v4l-utils`, `curl`, `wget`, `jq`, `tar`, `file`, …) のインストール
+2. CPU アーキテクチャの自動判定 (`linux_arm64` / `linux_armv7` / `linux_armv6` / `linux_amd64`)
+3. **MediaMTX バイナリの確実なダウンロード**
+   - リポジトリ内 `vendor/` ディレクトリの同梱物を **最優先**
+   - GitHub API で取得した最新リリース
+   - スクリプトに埋め込んだ既知バージョン (`v1.18.2`, `v1.13.1`, `v1.9.3`) へフォールバック
+   - `curl` → `wget` の順で試行、各バージョンで最大 5 回リトライ
+   - **`checksums.sha256` で SHA256 検証** (失敗すれば次の候補へ)
+   - 展開後に `mediamtx --version` を実行して **動かなければ別バージョンを試す**
+4. カメラの解像度を `v4l2-ctl --list-formats-ext` で問い合わせ、
+   希望解像度 (`WANT_VIDEO_SIZE`) がサポートされていなければ
+   **MJPEG 解像度の中から面積が最も近いものへ自動フォールバック**
+5. systemd ユニット (`mediamtx.service`, `ffmpeg-rtsp.service`) を生成
+   - `ffmpeg-rtsp` は `/dev/video0` と `127.0.0.1:8554` が ready になるまで最大 60 秒待機
+   - `SupplementaryGroups=video` で再ログイン無しでカメラへアクセス
+6. サービスを有効化＆起動し、視聴 URL を表示
 
-## 前提条件
+## 動作確認済み環境
 
-- Raspberry Pi 5（または arm64 / armv7 / amd64 の Linux マシン）
-- Raspberry Pi OS (64-bit) など、systemd ベースのディストリビューション
-- USB 接続の UVC 対応カメラ（`/dev/video0` として認識されるもの）
+- Raspberry Pi 5 / Raspberry Pi OS (64-bit, Bookworm 以降)
+- 任意の UVC USB カメラ (`/dev/video0`)
 
-## セットアップ方法
+`arm64` / `armv7` / `armv6` / `amd64` の任意の systemd ベース Linux でも動くはずです。
 
-1. リポジトリをクローンします。
-   ```bash
-   git clone https://github.com/Ryuto-dev/raspi-rtsp-streamer.git
-   cd raspi-rtsp-streamer
-   ```
-2. `setup.sh` に実行権限を与えて実行します。
-   ```bash
-   chmod +x setup.sh
-   ./setup.sh
-   ```
+---
 
-スクリプトは以下を自動で行います。
+## クイックスタート
 
-1. 必要なパッケージ（`ffmpeg`, `v4l-utils`, `wget`, `tar`, `curl`, `jq`）のインストール
-2. CPU アーキテクチャの自動判定（`arm64` / `armv7` / `amd64`）
-3. MediaMTX の取得
-   - `vendor/` ディレクトリに同梱バイナリがあれば**それを優先**して使用
-   - 無ければ GitHub の最新リリースを自動ダウンロード
-   - GitHub API が失敗した場合はフォールバックとして `v1.18.2` を直接ダウンロード
-4. ダウンロード後の動作確認（バイナリの実行 / `--version` チェック）
-5. systemd ユニットファイル（`mediamtx.service`, `ffmpeg-rtsp.service`）の生成と有効化
-6. サービスの起動
-
-## 使い方
-
-セットアップ完了後、ネットワーク内の PC から以下の URL でストリームを視聴できます（VLC など）。
-
-```
-rtsp://<Raspberry_PiのIPアドレス>:8554/live
+```bash
+git clone https://github.com/Ryuto-dev/raspi-rtsp-streamer.git
+cd raspi-rtsp-streamer
+chmod +x setup.sh
+./setup.sh
 ```
 
-### サービスの管理
+完了すると、ネットワーク内の PC (VLC など) から次の URL でストリームを視聴できます。
+
+```
+rtsp://<RaspiのIP>:8554/live
+```
+
+---
+
+## サービスの操作
 
 ```bash
 # 状態確認
 sudo systemctl status mediamtx ffmpeg-rtsp
 
 # ログを追跡
-journalctl -u mediamtx -f
+journalctl -u mediamtx    -f
 journalctl -u ffmpeg-rtsp -f
 
 # 停止 / 開始 / 再起動
 sudo systemctl stop    mediamtx ffmpeg-rtsp
 sudo systemctl start   mediamtx ffmpeg-rtsp
 sudo systemctl restart mediamtx ffmpeg-rtsp
+
+# このセットアップ済みの状態をひと目で確認
+./setup.sh --verify
+
+# セットアップを撤去 (systemd ユニットを削除)
+./setup.sh --uninstall
 ```
+
+---
 
 ## 設定の変更
 
-- **解像度・フレームレート**: `setup.sh` 上部の `VIDEO_SIZE`, `FRAMERATE` を変更してから再実行してください。
-- **MediaMTX の詳細設定**: `mediamtx.yml` を編集してから `./setup.sh` を再実行（`mediamtx.yml` が `~/mediamtx/` にコピーされます）。
+`setup.sh` 冒頭の変数、または環境変数で上書きできます。
 
-## MediaMTX バイナリをリポジトリに同梱したい場合（オフライン環境向け）
+| 変数 | デフォルト | 説明 |
+|------|------------|------|
+| `WANT_VIDEO_SIZE` | `1600x1200` | 希望解像度。カメラ非対応なら自動で最も近い MJPEG 解像度に変更 |
+| `WANT_FRAMERATE` | `15` | フレームレート |
+| `VIDEO_DEVICE` | `/dev/video0` | カメラデバイス |
+| `RTSP_PATH` | `live` | ストリームのパス (`rtsp://host:8554/<RTSP_PATH>`) |
+| `RTSP_PORT` | `8554` | RTSP ポート |
+| `TARGET_DIR` | `$HOME/mediamtx` | MediaMTX のインストール先 |
 
-ネットワークに接続できない環境でも `setup.sh` が動作するように、MediaMTX バイナリをリポジトリ内に同梱できます。
-
-### 手順
-
-1. リポジトリのルートに `vendor/` ディレクトリを作成します。
-   ```bash
-   mkdir -p vendor
-   ```
-2. [MediaMTX の Releases ページ](https://github.com/bluenviron/mediamtx/releases) から、ターゲットの Pi のアーキテクチャに合うアーカイブをダウンロードします。Raspberry Pi 5 (64-bit OS) の場合は `mediamtx_vX.Y.Z_linux_arm64.tar.gz` です。
-3. 以下のいずれかの方法でバイナリを `vendor/` に配置します。
-
-   **方法 A: tar.gz をそのまま配置**（推奨／ファイルサイズ大）
-   ```bash
-   # 例: arm64 用
-   cp ~/Downloads/mediamtx_v1.18.2_linux_arm64.tar.gz vendor/mediamtx_linux_arm64.tar.gz
-   ```
-   `setup.sh` は `vendor/mediamtx_<arch>.tar.gz` を見つけると自動展開します。
-
-   **方法 B: バイナリだけを配置**
-   ```bash
-   tar -xzf mediamtx_v1.18.2_linux_arm64.tar.gz mediamtx
-   mv mediamtx vendor/mediamtx_linux_arm64
-   chmod +x vendor/mediamtx_linux_arm64
-   ```
-   `<arch>` は `linux_arm64` / `linux_armv7` / `linux_amd64` のいずれか。
-   アーキテクチャ無印の `vendor/mediamtx` という名前でも認識されます（ただしクロスアーキの混在に注意）。
-
-4. Git に追加してコミット・プッシュします。
-   ```bash
-   git add vendor/
-   git commit -m "Bundle MediaMTX binary for offline setup"
-   git push
-   ```
-
-> **注意**: MediaMTX のバイナリは数十 MB あるため、同梱するとリポジトリサイズが大きくなります。LFS の使用、もしくは Releases にアタッチして `vendor/` には配置しないという運用も検討してください。
-
-### 同梱バイナリと自動ダウンロードの優先順位
-
-`setup.sh` は次の順序で MediaMTX を取得します。
-
-1. `vendor/mediamtx_<arch>` （バイナリ単体）
-2. `vendor/mediamtx`           （バイナリ単体・アーキ無印）
-3. `vendor/mediamtx_<arch>.tar.gz` （tar.gz アーカイブ）
-4. GitHub の最新リリース（API 経由）
-5. フォールバック固定バージョン（`MEDIAMTX_FALLBACK_VERSION` で指定）
-
-## IP アドレスの固定（オプション）
-
-Raspberry Pi の IP アドレスを固定したい場合は、`fixip.sh` を使用できます。
+例:
 
 ```bash
-sudo ./fixip.sh 10.40.99.X
+WANT_VIDEO_SIZE=1280x720 WANT_FRAMERATE=30 ./setup.sh
 ```
 
-※ スクリプト内の `GATEWAY`, `DNS_SERVERS`, `CONNECTION_NAME` などの変数は、使用するネットワーク環境に合わせて適宜修正してください。
+MediaMTX 自体の挙動を変えたい場合は `mediamtx.yml` を編集して `./setup.sh` を再実行してください。リポジトリ内の `mediamtx.yml` が `$TARGET_DIR/mediamtx.yml` にコピーされます。
+
+---
+
+## オフライン環境向け: MediaMTX バイナリの同梱
+
+完全オフラインの環境でも `setup.sh` を完走させたい場合、`vendor/` ディレクトリに MediaMTX のバイナリ or tar.gz を置いておけます。`setup.sh` は次の順序で検索します。
+
+1. `vendor/mediamtx_<arch>`         (素のバイナリ。`<arch>` は `linux_arm64` 等)
+2. `vendor/mediamtx`                (素のバイナリ、アーキ無印)
+3. `vendor/mediamtx_<arch>.tar.gz`  (公式 tar.gz)
+4. `vendor/mediamtx.tar.gz`         (アーキ無印 tar.gz)
+5. GitHub API の最新リリース
+6. 既知バージョン (`v1.18.2`, `v1.13.1`, `v1.9.3`) に順次フォールバック
+
+### バイナリの入れ方 (例: Raspberry Pi 5)
+
+```bash
+mkdir -p vendor
+# 例: arm64 / v1.18.2
+curl -LO https://github.com/bluenviron/mediamtx/releases/download/v1.18.2/mediamtx_v1.18.2_linux_arm64.tar.gz
+mv mediamtx_v1.18.2_linux_arm64.tar.gz vendor/mediamtx_linux_arm64.tar.gz
+
+git add vendor/
+git commit -m "Bundle MediaMTX binary for offline setup"
+git push
+```
+
+> **メモ:** バイナリは 25 MB 程度あります。リポジトリサイズを気にする場合は Git LFS の利用や、Releases にのみ添付して `vendor/` には置かない運用も可能です。
+
+---
+
+## IP アドレスの固定 (`fixip.sh`)
+
+NetworkManager (`nmcli`) ベースで有線 IP を固定するヘルパーです。
+
+```bash
+# 例: 10.40.99.20 を /16 で固定 (デフォルト)
+sudo ./fixip.sh 10.40.99.20
+
+# サブネットマスクを変えたい場合
+sudo ./fixip.sh 192.168.1.20 24
+```
+
+スクリプト冒頭の `GATEWAY` / `DNS_SERVERS` / `CONNECTION_NAME` を環境に合わせて編集するか、環境変数で上書きしてください。
+
+```bash
+GATEWAY=192.168.1.1 DNS_SERVERS=1.1.1.1,1.0.0.1 CONNECTION_NAME="Wired connection 1" \
+  sudo -E ./fixip.sh 192.168.1.20 24
+```
+
+---
 
 ## トラブルシューティング
 
 ### `mediamtx.service` が `status=203/EXEC` で停止する
 
-バイナリが見つからない・実行権限がない・アーキテクチャ不一致のいずれかです。
+バイナリが存在しない / 実行権限が無い / アーキテクチャ不一致 のいずれかです。`setup.sh` を再実行すれば自動的にダウンロードし直し、`--version` で実行可能性を確認します。
 
 ```bash
 ls -l ~/mediamtx/mediamtx
-file   ~/mediamtx/mediamtx     # ELF ヘッダのアーキを確認
-~/mediamtx/mediamtx --version  # 実行できるか
+file   ~/mediamtx/mediamtx       # ELF のアーキテクチャを確認
+~/mediamtx/mediamtx --version    # 実行できるか
 ```
 
-`setup.sh` を再実行すれば、自動でダウンロードと検証が走ります。
+### `ffmpeg-rtsp.service` が `Connection refused` で落ちる
 
-### `ffmpeg-rtsp.service` が起動しない / 接続が切れる
+MediaMTX がまだポートを開いていないタイミングで ffmpeg が接続しに行ったケースです。本リポジトリの systemd ユニットには **8554 ポートが listen するまで最大 60 秒待つ** `ExecStartPre` を入れてあるため、通常は発生しません。発生する場合は MediaMTX 側のエラーが先に出ているはずです。
 
 ```bash
-journalctl -u ffmpeg-rtsp -n 100 --no-pager
-ls -l /dev/video0
-v4l2-ctl --list-devices
+journalctl -u mediamtx    -n 80 --no-pager
+journalctl -u ffmpeg-rtsp -n 80 --no-pager
+```
+
+### `The V4L2 driver changed the video from 1600x1200 to 1280x720`
+
+カメラが希望解像度をサポートしていません。`setup.sh` 側で自動フォールバックされますが、強制的に別の解像度に固定したい場合は次のように指定してください。
+
+```bash
+WANT_VIDEO_SIZE=1280x720 WANT_FRAMERATE=30 ./setup.sh
+```
+
+カメラの対応形式は次で確認できます。
+
+```bash
 v4l2-ctl --list-formats-ext -d /dev/video0
 ```
 
-カメラが MJPEG / 1600x1200 / 15fps をサポートしていない場合は、`setup.sh` の `VIDEO_SIZE` / `FRAMERATE` / `-input_format` を環境に合わせて調整してください。
+### videoグループ権限が反映されない
 
-### videoグループの権限が反映されない
+`setup.sh` は `usermod -aG video` を行いますが、systemd 側でも `SupplementaryGroups=video` を指定しているため、再ログイン無しでカメラへアクセスできます。CLI から手動で ffmpeg を叩く場合は、一度ログアウト→ログインしてください。
 
-`setup.sh` 自体は `usermod -aG video` を行いますが、systemd 側で `SupplementaryGroups=video` を指定しているため、再ログイン無しでもカメラにアクセスできます。手動で `ffmpeg` を起動する場合は一度ログアウト→ログインしてください。
+---
 
 ## ファイル構成
 
-- `setup.sh`     : 自動セットアップスクリプト（MediaMTX のダウンロード・systemd 登録・サービス起動）。
-- `fixip.sh`     : NetworkManager で IP アドレスを固定するスクリプト。
-- `mediamtx.yml` : MediaMTX の設定ファイル（`~/mediamtx/` にコピーされて使用される）。
-- `vendor/`     *(任意)* : 同梱用 MediaMTX バイナリの置き場所。
+```
+.
+├── setup.sh        # 自動セットアップスクリプト (本体)
+├── fixip.sh        # NetworkManager で IP を固定するヘルパー
+├── mediamtx.yml    # MediaMTX 最小設定 (RTSP 8554/tcp で publisher/reader を受け付ける)
+├── README.md       # このファイル
+└── vendor/         # (任意) オフライン用 MediaMTX バイナリ置き場
+```
+
+## ライセンス
+
+MIT License (本リポジトリのスクリプト群)
+MediaMTX 自体のライセンスは [本家リポジトリ](https://github.com/bluenviron/mediamtx) を参照してください。

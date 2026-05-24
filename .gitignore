@@ -1,0 +1,10 @@
+# 一時ファイル / OS
+*.log
+*.pid
+.DS_Store
+Thumbs.db
+
+# vendor/ 配下の大容量バイナリは原則同梱しないでください (Git LFS 推奨)
+# 必要に応じて下の行をコメントアウトしてください。
+# vendor/*
+# !vendor/.gitkeep
