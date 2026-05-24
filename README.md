@@ -66,7 +66,18 @@ rtsp://<Raspberry_PiのIPアドレス>:8554/live
 - **解像度やフレームレート**: `setup.sh` 内の FFmpeg の実行引数を変更して再実行してください。
 - **MediaMTXの詳細設定**: `mediamtx.yml` を編集してください。
 
+## IPアドレスの固定（オプション）
+
+Raspberry PiのIPアドレスを固定したい場合は、`fixip.sh` を使用できます。
+
+```bash
+sudo ./fixip.sh 10.40.99.X
+```
+
+※ **注意**: スクリプト内の `GATEWAY`, `DNS_SERVERS`, `CONNECTION_NAME` などの変数は、使用するネットワーク環境に合わせて適宜修正してください。
+
 ## ファイル構成
 
 - `setup.sh`: 自動セットアップスクリプト。
-- `mediamtx.yml`: MediaMTXの設定ファイル。
+- `fixip.sh`: NetworkManagerを使用してIPアドレスを固定するスクリプト。
+- `mediamtx.yml`: MediaMTXの設定ファイル（サーバーの動作設定）。
