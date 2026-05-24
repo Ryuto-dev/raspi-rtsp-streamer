@@ -78,7 +78,7 @@ sudo systemctl restart mediamtx ffmpeg-rtsp
 | 変数 | デフォルト | 説明 |
 |------|------------|------|
 | `WANT_VIDEO_SIZE` | `1600x1200` | 希望解像度。カメラ非対応なら自動で最も近い MJPEG 解像度に変更 |
-| `WANT_FRAMERATE` | `15` | フレームレート |
+| `WANT_FRAMERATE` | `30` | フレームレート |
 | `VIDEO_DEVICE` | `/dev/video0` | カメラデバイス |
 | `RTSP_PATH` | `live` | ストリームのパス (`rtsp://host:8554/<RTSP_PATH>`) |
 | `RTSP_PORT` | `8554` | RTSP ポート |
