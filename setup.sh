@@ -1,28 +1,99 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Raspberry Pi 5 RTSP Streamer Auto Setup (v2 - Full Rewrite)
+#  Raspberry Pi 5 RTSP Streamer Auto Setup (v3 - Low-Latency Default)
 #
-#  特徴:
-#   - MediaMTX を「確実に」ダウンロードして配置する多段フォールバック実装
-#       1) vendor/ ディレクトリの同梱バイナリ / tar.gz を最優先
-#       2) GitHub API で取得した最新バージョン
-#       3) スクリプトに埋め込まれた既知バージョン (常時更新可能)
-#       4) curl と wget の両方を試す
-#   - 取得した tar.gz は (可能なら) SHA256 で検証
-#   - バイナリ実行可能性 (--version) で最終確認、不正なら次の候補へ
-#   - カメラの解像度を v4l2-ctl で実機問い合わせし、要望解像度が無ければ
-#     自動で最も近い MJPEG 解像度にフォールバック
-#   - systemd ユニットは「MediaMTX が RTSP:8554 を listen するまで待ってから
-#     ffmpeg を起動」する堅牢な順序
+#  主な変更点 (v3):
+#   - **デフォルトを「超低遅延モード」に変更** (1280x720 @ 15fps / -g 15)
+#       参考コマンド:
+#         ffmpeg -f v4l2 -fflags nobuffer -flags low_delay \
+#                -input_format mjpeg -video_size 1280x720 -framerate 15 \
+#                -i /dev/video0 \
+#                -c:v libx264 -preset ultrafast -tune zerolatency \
+#                -g 15 -bf 0 -rtsp_transport tcp -f rtsp rtsp://localhost:8554/live
+#   - `--standard` (または `LATENCY_MODE=standard`) で従来の高解像度モード
+#     (1600x1200 @ 30fps) に切り替え可能
+#   - `--force-resolution` (または `FORCE_RESOLUTION=1`) で
+#     v4l2 サポート判定を無視して指定解像度を強制
+#       ※ ただし v4l2-ctl による「カメラが本当にその解像度に対応しているか」の
+#         確認は行い、未対応なら警告ログを出す。完全に確認不能な場合のみエラー終了。
+#   - 解像度サポート確認を MJPEG だけでなく全フォーマットに拡張
 #
 #  使い方:
 #     chmod +x setup.sh
-#     ./setup.sh                # 通常セットアップ
-#     ./setup.sh --uninstall    # サービス停止＆ユニット削除
-#     ./setup.sh --verify       # 状態確認のみ
+#     ./setup.sh                          # 超低遅延モード (デフォルト)
+#     ./setup.sh --standard               # 従来モード (1600x1200 @ 30fps)
+#     ./setup.sh --force-resolution       # カメラ非対応と判定されても指定解像度を強制
+#     ./setup.sh --uninstall              # サービス停止＆ユニット削除
+#     ./setup.sh --verify                 # 状態確認のみ
+#
+#  環境変数による上書き:
+#     LATENCY_MODE=low|standard           # モード切替 (デフォルト: low)
+#     FORCE_RESOLUTION=1                  # 解像度サポート判定を無視
+#     WANT_VIDEO_SIZE=1280x720            # 明示指定するとモードのデフォルトを上書き
+#     WANT_FRAMERATE=15                   # 明示指定するとモードのデフォルトを上書き
+#     VIDEO_DEVICE=/dev/video0
+#     RTSP_PATH=live
+#     RTSP_PORT=8554
+#     TARGET_DIR=$HOME/mediamtx
 # =============================================================================
 
 set -euo pipefail
+
+# ---- モード切替 ------------------------------------------------------------
+# デフォルトは超低遅延モード (low)。`--standard` または LATENCY_MODE=standard で従来モード。
+LATENCY_MODE="${LATENCY_MODE:-low}"
+# 解像度サポート判定を無視して指定解像度を強制するか
+FORCE_RESOLUTION="${FORCE_RESOLUTION:-0}"
+
+# 環境変数で WANT_VIDEO_SIZE / WANT_FRAMERATE が事前に明示指定されたかを覚えておく
+# (モードによるデフォルト上書き判定で使う)
+_USER_SET_VIDEO_SIZE=0
+_USER_SET_FRAMERATE=0
+[[ -n "${WANT_VIDEO_SIZE:-}" ]] && _USER_SET_VIDEO_SIZE=1
+[[ -n "${WANT_FRAMERATE:-}"  ]] && _USER_SET_FRAMERATE=1
+
+# ---- コマンドライン引数 (モード切替) ---------------------------------------
+# main() でも `--verify` / `--uninstall` を扱うが、それより前にモード系フラグだけ
+# 抜き出しておく必要があるのでここで先に処理する。
+_REMAINING_ARGS=()
+while (($#)); do
+  case "$1" in
+    --low-latency|--ultra-low-latency)
+      LATENCY_MODE="low"; shift ;;
+    --standard|--normal|--high-quality)
+      LATENCY_MODE="standard"; shift ;;
+    --force-resolution|--force)
+      FORCE_RESOLUTION=1; shift ;;
+    --mode=*)
+      LATENCY_MODE="${1#*=}"; shift ;;
+    *)
+      _REMAINING_ARGS+=("$1"); shift ;;
+  esac
+done
+# verify/uninstall などはここで再セット (空配列でも安全に扱う)
+if ((${#_REMAINING_ARGS[@]})); then
+  set -- "${_REMAINING_ARGS[@]}"
+else
+  set --
+fi
+
+# ---- モード別デフォルト ----------------------------------------------------
+case "$LATENCY_MODE" in
+  low)
+    # 超低遅延モード (参考コマンドに合わせる)
+    : "${WANT_VIDEO_SIZE:=1280x720}"
+    : "${WANT_FRAMERATE:=15}"
+    ;;
+  standard)
+    # 従来モード (高解像度・高フレームレート)
+    : "${WANT_VIDEO_SIZE:=1600x1200}"
+    : "${WANT_FRAMERATE:=30}"
+    ;;
+  *)
+    echo "[err ] 未知の LATENCY_MODE: $LATENCY_MODE (low / standard のいずれかを指定してください)" >&2
+    exit 1
+    ;;
+esac
 
 # ---- ユーザー設定 ----------------------------------------------------------
 # RTSP のパス (rtsp://<host>:8554/<RTSP_PATH>)
@@ -31,9 +102,6 @@ RTSP_PATH="${RTSP_PATH:-live}"
 RTSP_PORT="${RTSP_PORT:-8554}"
 # カメラデバイス
 VIDEO_DEVICE="${VIDEO_DEVICE:-/dev/video0}"
-# 希望解像度・FPS (カメラがサポートしない場合は自動で最も近い MJPEG 解像度に変更)
-WANT_VIDEO_SIZE="${WANT_VIDEO_SIZE:-1600x1200}"
-WANT_FRAMERATE="${WANT_FRAMERATE:-30}"
 
 # MediaMTX のインストール先
 TARGET_DIR="${TARGET_DIR:-$HOME/mediamtx}"
@@ -59,9 +127,19 @@ err()   { echo "${RED}[err ]${RST} $*" >&2; }
 die()   { err "$*"; exit 1; }
 
 banner() {
+  local mode_label
+  case "$LATENCY_MODE" in
+    low)      mode_label="ULTRA-LOW-LATENCY (default)";;
+    standard) mode_label="STANDARD (high quality)";;
+    *)        mode_label="$LATENCY_MODE";;
+  esac
   echo "=================================================="
-  echo "  Raspberry Pi 5 RTSP Streamer Auto Setup (v2)"
-  echo "  Target: ${WANT_VIDEO_SIZE} @ ${WANT_FRAMERATE}fps / RTSP (TCP) :${RTSP_PORT}/${RTSP_PATH}"
+  echo "  Raspberry Pi 5 RTSP Streamer Auto Setup (v3)"
+  echo "  Mode   : ${mode_label}"
+  echo "  Target : ${WANT_VIDEO_SIZE} @ ${WANT_FRAMERATE}fps / RTSP (TCP) :${RTSP_PORT}/${RTSP_PATH}"
+  if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+    echo "  Force  : 解像度サポート判定を無視して強制適用"
+  fi
   echo "=================================================="
 }
 
@@ -321,8 +399,46 @@ install_mediamtx_yml() {
   fi
 }
 
+# ---- カメラのサポート解像度を全フォーマットから取得 ----------------------
+# 出力: "MJPG:1280x720" 形式の改行区切りリスト (大文字小文字を正規化)
+# 取得失敗時は空文字列を返し、戻り値は常に 0。
+list_camera_modes() {
+  if [[ ! -e "$VIDEO_DEVICE" ]] || ! command -v v4l2-ctl >/dev/null 2>&1; then
+    return 0
+  fi
+  local raw
+  if ! raw="$(v4l2-ctl --list-formats-ext -d "$VIDEO_DEVICE" 2>/dev/null)"; then
+    return 0
+  fi
+  # awk で「現在パース中のピクセルフォーマット」と「Size: Discrete WxH」を組み合わせる
+  echo "$raw" | awk '
+    # 例: "        [0]: '"'"'MJPG'"'"' (Motion-JPEG, compressed)"
+    /\[[0-9]+\]:[[:space:]]*'"'"'[^'"'"']+'"'"'/ {
+      # シングルクォートで囲まれた fourcc を抽出
+      match($0, /'"'"'[^'"'"']+'"'"'/)
+      if (RSTART > 0) {
+        fmt = substr($0, RSTART+1, RLENGTH-2)
+      }
+      next
+    }
+    /Size: Discrete[[:space:]]+[0-9]+x[0-9]+/ {
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^[0-9]+x[0-9]+$/) {
+          if (fmt != "") {
+            print fmt ":" $i
+          }
+        }
+      }
+    }
+  ' | sort -u
+}
+
 # ---- カメラ解像度の自動解決 -----------------------------------------------
-# 希望解像度がサポートされていれば採用、無ければ MJPEG の中から「面積が最も近い」候補へ
+# 解決順:
+#   1) FORCE_RESOLUTION=1 なら、サポート確認は行うが、未サポートでも指定値を強制
+#      (確認は警告のみ。完全に確認不能な場合はそのまま強制)
+#   2) 通常モードでは、希望解像度がサポートされていれば採用、無ければ
+#      MJPEG (なければ他フォーマット) の中から「面積が最も近い」候補へフォールバック
 resolve_video_size() {
   local want="$WANT_VIDEO_SIZE"
   RESOLVED_VIDEO_SIZE="$want"
@@ -330,8 +446,12 @@ resolve_video_size() {
 
   if [[ ! -e "$VIDEO_DEVICE" ]]; then
     warn "$VIDEO_DEVICE が現時点で存在しないため、解像度の自動検出をスキップします。"
-    warn "起動時に $VIDEO_DEVICE が現れない場合や指定解像度をサポートしない場合は、"
-    warn "ffmpeg が失敗する可能性があります。"
+    if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+      warn "FORCE_RESOLUTION=1 のため、起動時に ${want} を強制適用します。"
+    else
+      warn "起動時に $VIDEO_DEVICE が現れない場合や指定解像度をサポートしない場合は、"
+      warn "ffmpeg が失敗する可能性があります。"
+    fi
     return 0
   fi
   if ! command -v v4l2-ctl >/dev/null 2>&1; then
@@ -339,30 +459,106 @@ resolve_video_size() {
     return 0
   fi
 
-  local list
-  if ! list="$(v4l2-ctl --list-formats-ext -d "$VIDEO_DEVICE" 2>/dev/null)"; then
-    warn "v4l2-ctl で解像度を取得できませんでした。指定値をそのまま使います。"
+  # 全フォーマットからサポートモードを取得
+  local modes
+  modes="$(list_camera_modes || true)"
+
+  if [[ -z "$modes" ]]; then
+    warn "カメラのサポート解像度一覧を取得できませんでした。"
+    if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+      warn "FORCE_RESOLUTION=1 のため、${want} を強制適用します。"
+      return 0
+    fi
+    warn "指定値 (${want}) をそのまま使用します。動作しない場合は別の解像度をお試しください。"
     return 0
   fi
 
-  # MJPEG セクションを抽出して 'Size: Discrete WxH' を集める
-  local mjpeg_block
-  mjpeg_block="$(echo "$list" | awk '
-    /\[[0-9]+\]:/ { in_blk=0 }
-    /MJPG|Motion-JPEG|MJPEG/ { in_blk=1 }
-    in_blk { print }
-  ')"
+  # 希望解像度が MJPEG でサポートされているか
+  local has_mjpeg_want=0
+  local has_any_want=0
+  local supported_formats_for_want=""
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    local fmt="${line%%:*}"
+    local sz="${line#*:}"
+    if [[ "$sz" == "$want" ]]; then
+      has_any_want=1
+      supported_formats_for_want+="${fmt} "
+      # MJPG / MJPEG / Motion-JPEG いずれかを MJPEG として扱う
+      case "$fmt" in
+        MJPG|MJPEG|Motion-JPEG|*MJPEG*) has_mjpeg_want=1 ;;
+      esac
+    fi
+  done <<< "$modes"
 
-  local sizes
-  sizes="$(echo "$mjpeg_block" | grep -oE 'Size: Discrete [0-9]+x[0-9]+' | awk '{print $3}' | sort -u || true)"
-
-  if [[ -z "$sizes" ]]; then
-    warn "カメラの MJPEG 解像度一覧が取得できません。指定値をそのまま使います。"
-    return 0
-  fi
-
-  if echo "$sizes" | grep -qx "$want"; then
+  if (( has_mjpeg_want == 1 )); then
     ok "camera supports requested MJPEG ${want}"
+    RESOLVED_VIDEO_SIZE="$want"
+    RESOLVED_INPUT_FORMAT="mjpeg"
+    return 0
+  fi
+
+  if (( has_any_want == 1 )); then
+    # MJPEG では未対応だが他フォーマットでは対応している
+    warn "${want} は MJPEG では未対応ですが、他のフォーマットでは対応しています: ${supported_formats_for_want}"
+    if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+      warn "FORCE_RESOLUTION=1 のため、MJPEG で ${want} を強制適用します (ffmpeg が失敗する可能性あり)。"
+      RESOLVED_VIDEO_SIZE="$want"
+      RESOLVED_INPUT_FORMAT="mjpeg"
+      return 0
+    fi
+    # MJPEG にこだわらず、最初に見つかった対応フォーマットを使う
+    local first_fmt="${supported_formats_for_want%% *}"
+    # ffmpeg の -input_format 名にマップ (主要なものだけ)
+    local ff_fmt="mjpeg"
+    case "$first_fmt" in
+      YUYV|YUYV422) ff_fmt="yuyv422" ;;
+      UYVY)         ff_fmt="uyvy422" ;;
+      NV12)         ff_fmt="nv12"    ;;
+      NV21)         ff_fmt="nv21"    ;;
+      H264|h264)    ff_fmt="h264"    ;;
+      MJPG|MJPEG|Motion-JPEG|*MJPEG*) ff_fmt="mjpeg" ;;
+      *) ff_fmt="$(echo "$first_fmt" | tr '[:upper:]' '[:lower:]')" ;;
+    esac
+    warn "${want} を ${first_fmt} (-input_format ${ff_fmt}) で使用します。"
+    RESOLVED_VIDEO_SIZE="$want"
+    RESOLVED_INPUT_FORMAT="$ff_fmt"
+    return 0
+  fi
+
+  # ここに来たということは、どのフォーマットでも want は未サポート
+  if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+    warn "カメラは ${want} を (どのフォーマットでも) サポートしていません。"
+    warn "FORCE_RESOLUTION=1 が指定されているため、MJPEG で ${want} を強制適用します。"
+    warn "ffmpeg が失敗する可能性が高いです。失敗する場合は --standard または別解像度をご検討ください。"
+    warn "  カメラがサポートしている解像度:"
+    echo "$modes" | sed 's/^/    /' >&2
+    RESOLVED_VIDEO_SIZE="$want"
+    RESOLVED_INPUT_FORMAT="mjpeg"
+    return 0
+  fi
+
+  # MJPEG モードの中で面積が最も近い解像度にフォールバック
+  local mjpeg_sizes
+  mjpeg_sizes="$(echo "$modes" | awk -F: '
+    {
+      fmt=$1; sz=$2
+      if (fmt=="MJPG" || fmt=="MJPEG" || fmt=="Motion-JPEG" || fmt ~ /MJPEG/) {
+        print sz
+      }
+    }' | sort -u)"
+
+  local pool="$mjpeg_sizes"
+  local pool_label="MJPEG"
+  if [[ -z "$pool" ]]; then
+    # MJPEG が一切無いカメラの場合は全フォーマットから選ぶ
+    pool="$(echo "$modes" | awk -F: '{print $2}' | sort -u)"
+    pool_label="非MJPEG (yuyv422 等)"
+    RESOLVED_INPUT_FORMAT="yuyv422"
+  fi
+
+  if [[ -z "$pool" ]]; then
+    warn "解像度プールが空です。指定値 (${want}) をそのまま使用します。"
     return 0
   fi
 
@@ -381,11 +577,13 @@ resolve_video_size() {
     if [[ -z "$best" || "$diff" -lt "$best_diff" ]]; then
       best="$s"; best_diff="$diff"
     fi
-  done <<< "$sizes"
+  done <<< "$pool"
 
   if [[ -n "$best" ]]; then
-    warn "カメラは ${want} をサポートしません。代わりに ${best} を使用します。"
-    warn "  利用可能な MJPEG 解像度: $(echo "$sizes" | paste -sd' ' -)"
+    warn "カメラは ${want} をサポートしません。代わりに ${best} を使用します (${pool_label})。"
+    warn "  --force-resolution を指定すれば ${want} を強制適用できます (動作保証なし)。"
+    warn "  利用可能な解像度:"
+    echo "$modes" | sed 's/^/    /' >&2
     RESOLVED_VIDEO_SIZE="$best"
   fi
 }
@@ -413,12 +611,32 @@ LimitNOFILE=65535
 WantedBy=multi-user.target
 EOF
 
+  # ffmpeg のオプションをモードに応じて構築
+  # 参考コマンド (low モード):
+  #   ffmpeg -f v4l2 -fflags nobuffer -flags low_delay \
+  #          -input_format mjpeg -video_size 1280x720 -framerate 15 -i /dev/video0 \
+  #          -c:v libx264 -preset ultrafast -tune zerolatency \
+  #          -g 15 -bf 0 -rtsp_transport tcp -f rtsp rtsp://localhost:8554/live
+  local ffmpeg_input_opts
+  local ffmpeg_output_opts
+  local gop="$WANT_FRAMERATE"
+
+  if [[ "$LATENCY_MODE" == "low" ]]; then
+    # 超低遅延: バッファリング極小化, GOP=framerate, B-frame無効
+    ffmpeg_input_opts="-f v4l2 -fflags nobuffer -flags low_delay -input_format ${RESOLVED_INPUT_FORMAT} -video_size ${RESOLVED_VIDEO_SIZE} -framerate ${WANT_FRAMERATE}"
+    ffmpeg_output_opts="-c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p -g ${gop} -bf 0"
+  else
+    # 従来モード (高画質寄り)
+    ffmpeg_input_opts="-f v4l2 -input_format ${RESOLVED_INPUT_FORMAT} -video_size ${RESOLVED_VIDEO_SIZE} -framerate ${WANT_FRAMERATE}"
+    ffmpeg_output_opts="-c:v libx264 -preset veryfast -tune zerolatency -pix_fmt yuv420p -g $(( gop * 2 )) -bf 0"
+  fi
+
   # ffmpeg ユニット:
   #  - /dev/video0 を最大 60 秒待つ
   #  - RTSP:8554 が listen するのを最大 60 秒待つ (これで Connection refused を防ぐ)
   sudo tee /etc/systemd/system/ffmpeg-rtsp.service >/dev/null <<EOF
 [Unit]
-Description=FFmpeg UVC to RTSP Streamer
+Description=FFmpeg UVC to RTSP Streamer (mode=${LATENCY_MODE})
 After=network-online.target mediamtx.service
 Wants=network-online.target
 Requires=mediamtx.service
@@ -430,11 +648,9 @@ SupplementaryGroups=video
 ExecStartPre=/bin/bash -c 'for i in \$(seq 1 60); do [ -e ${VIDEO_DEVICE} ] && exit 0; sleep 1; done; echo "${VIDEO_DEVICE} not found"; exit 1'
 ExecStartPre=/bin/bash -c 'for i in \$(seq 1 60); do (exec 3<>/dev/tcp/127.0.0.1/${RTSP_PORT}) 2>/dev/null && exec 3<&- && exec 3>&- && exit 0; sleep 1; done; echo "RTSP port ${RTSP_PORT} not ready"; exit 1'
 ExecStart=/usr/bin/ffmpeg -nostdin -hide_banner -loglevel warning \\
-  -f v4l2 -fflags nobuffer -flags low_delay \\
-  -input_format ${RESOLVED_INPUT_FORMAT} -video_size ${RESOLVED_VIDEO_SIZE} -framerate ${WANT_FRAMERATE} \\
+  ${ffmpeg_input_opts} \\
   -i ${VIDEO_DEVICE} \\
-  -c:v libx264 -preset ultrafast -tune zerolatency -pix_fmt yuv420p \\
-  -g ${WANT_FRAMERATE} -bf 0 \\
+  ${ffmpeg_output_opts} \\
   -rtsp_transport tcp -f rtsp rtsp://127.0.0.1:${RTSP_PORT}/${RTSP_PATH}
 Restart=on-failure
 RestartSec=5
@@ -443,7 +659,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-  ok "wrote /etc/systemd/system/{mediamtx,ffmpeg-rtsp}.service"
+  ok "wrote /etc/systemd/system/{mediamtx,ffmpeg-rtsp}.service (mode=${LATENCY_MODE})"
 }
 
 # ---- サービス起動 ---------------------------------------------------------
@@ -473,19 +689,34 @@ start_services() {
 summary() {
   local ip
   ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  local mode_label
+  case "$LATENCY_MODE" in
+    low)      mode_label="ULTRA-LOW-LATENCY";;
+    standard) mode_label="STANDARD";;
+    *)        mode_label="$LATENCY_MODE";;
+  esac
   echo
   echo "=================================================="
   echo "  ✅ セットアップが完了しました"
   echo "--------------------------------------------------"
   echo "  視聴URL : rtsp://${ip:-<このRaspiのIP>}:${RTSP_PORT}/${RTSP_PATH}"
+  echo "  モード  : ${mode_label}"
   echo "  解像度  : ${RESOLVED_VIDEO_SIZE} @ ${WANT_FRAMERATE}fps  (希望: ${WANT_VIDEO_SIZE})"
   echo "  入力    : ${VIDEO_DEVICE} (${RESOLVED_INPUT_FORMAT})"
+  if [[ "$FORCE_RESOLUTION" == "1" ]]; then
+    echo "  Force   : 解像度サポート判定を無視して強制適用中"
+  fi
   echo "--------------------------------------------------"
   echo "  状態   : sudo systemctl status mediamtx ffmpeg-rtsp"
   echo "  ログ   : journalctl -u mediamtx -f"
   echo "         : journalctl -u ffmpeg-rtsp -f"
   echo "  検証   : ./setup.sh --verify"
   echo "  撤去   : ./setup.sh --uninstall"
+  echo "--------------------------------------------------"
+  echo "  従来モード(高画質)で再構築する場合:"
+  echo "    ./setup.sh --standard"
+  echo "  低遅延モードで解像度を強制する場合:"
+  echo "    ./setup.sh --force-resolution WANT_VIDEO_SIZE=1600x1200"
   echo "=================================================="
 }
 
@@ -535,7 +766,7 @@ main() {
     --verify)     do_verify;    exit 0 ;;
     --uninstall)  do_uninstall; exit 0 ;;
     -h|--help)
-      sed -n '2,40p' "$0"; exit 0 ;;
+      sed -n '2,39p' "$0"; exit 0 ;;
   esac
 
   require_user
